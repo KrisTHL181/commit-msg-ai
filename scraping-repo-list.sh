@@ -48,8 +48,7 @@ OPTIONS:
   --min-stars N    Minimum number of stars (default: 100)
   -h, --help       Show this help
 
-Example:
-  $0 5 'python,javascript' --min-stars 500
+Note: Repositories listed in exclude-repos.sh (as EXCLUDE_REPOS array) will be excluded.
 EOF
 }
 
@@ -100,6 +99,16 @@ SAFE_LANGS=$(echo "$LANG_LIST" | tr ',' '_' | tr -d '[:space:]' | tr '[:upper:]'
 OUTPUT_FILE="top_$((MAX_PAGES * 100))_${SAFE_LANGS}_min${MIN_STARS}_repos.txt"
 
 >"$OUTPUT_FILE"
+
+# Load exclusion list from exclude-repos.sh if it exists
+EXCLUDE_REPOS=()
+if [[ -f "./exclude-repos.sh" ]]; then
+    # Source the file in a subshell to avoid polluting global scope
+    source ./exclude-repos.sh
+    echo "Loaded $((${#EXCLUDE_REPOS[@]})) repositories to exclude from exclude-repos.sh"
+else
+    echo "No exclude-repos.sh found — no repositories will be excluded."
+fi
 
 # Parse languages
 IFS=',' read -ra LANGUAGES <<<"$LANG_LIST"
@@ -159,7 +168,16 @@ for lang in "${LANGUAGES[@]}"; do
     echo ""
 done
 
-# Deduplicate and sort
+# Deduplicate
 sort -u "$OUTPUT_FILE" -o "$OUTPUT_FILE"
+
+# Exclude repos listed in EXCLUDE_REPOS array
+if [[ ${#EXCLUDE_REPOS[@]} -gt 0 ]]; then
+    TMP_FILE=$(mktemp)
+    # Convert array to newline-separated string for grep
+    printf '%s\n' "${EXCLUDE_REPOS[@]}" > "$TMP_FILE"
+    grep -F -v -f "$TMP_FILE" "$OUTPUT_FILE" > "${OUTPUT_FILE}.filtered" && mv "${OUTPUT_FILE}.filtered" "$OUTPUT_FILE"
+    rm -f "$TMP_FILE"
+fi
 
 echo "Done! Results saved to $OUTPUT_FILE (total $(wc -l <"$OUTPUT_FILE") repos)"
