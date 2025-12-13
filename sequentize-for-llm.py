@@ -55,12 +55,6 @@ def main():
     parser.add_argument("input_dir", help="Directory containing .jsonl files")
     parser.add_argument("output_file", type=str, default="samples.jsonl", help="Output text file for LLM training")
     parser.add_argument(
-        "--max-length",
-        type=int,
-        default=4096,
-        help="Maximum total token length (approximate char limit; adjust as needed), 0 = unlimited",
-    )
-    parser.add_argument(
         "--min-length", type=int, default=3, help="Minimum commit message length (inclusive), 0 = unlimited"
     )
     args = parser.parse_args()
@@ -88,10 +82,6 @@ def main():
 
                         formatted = format_prompt(sample, args.min_length)
                         if formatted is None:
-                            continue
-
-                        # Length filter
-                        if len(formatted[0]) + len(formatted[1]) > args.max_length:
                             continue
 
                         out_f.write(json.dumps({"prompt": formatted[0], "target": formatted[1]}))
