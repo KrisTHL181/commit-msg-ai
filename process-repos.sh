@@ -1,0 +1,232 @@
+#!/bin/bash
+# Extract structured commit data from local Git repositories into JSONL format.
+# Supports parallel processing via --threads.
+
+set -euo pipefail
+
+# Default values
+DEFAULT_REPOS_DIR="repos"
+DEFAULT_OUTPUT_DIR="commit_data"
+DEFAULT_MAX_COMMITS=1000
+DEFAULT_MAX_DIFF_SIZE=50000         # 50 KB
+DEFAULT_MAX_CONTRIBUTING_SIZE=10000 # 10 KB
+DEFAULT_THREADS=1
+
+show_help() {
+	cat <<EOF
+Usage: $0 [OPTIONS]
+
+Extract commit history from local Git repositories into structured JSONL files.
+
+OPTIONS:
+  -r, --repos-dir DIR          Path to directory containing cloned repositories (default: '$DEFAULT_REPOS_DIR')
+  -o, --output-dir DIR         Output directory for JSONL files (default: '$DEFAULT_OUTPUT_DIR')
+  -m, --max-commits N          Maximum number of commits to extract per repository (default: $DEFAULT_MAX_COMMITS)
+  -d, --max-diff-size BYTES    Truncate diffs larger than this (default: $DEFAULT_MAX_DIFF_SIZE bytes)
+  -c, --max-contrib-size BYTES Truncate CONTRIBUTING.md larger than this (default: $DEFAULT_MAX_CONTRIBUTING_SIZE bytes)
+  -t, --threads N              Number of parallel threads (default: $DEFAULT_THREADS)
+  -h, --help                   Show this help message
+
+REQUIRES: jq, GNU parallel
+
+EXAMPLE:
+  $0 -r ./my_repos -o ./dataset -m 500 -t 8
+EOF
+}
+
+# Parse command-line arguments
+REPOS_DIR="$DEFAULT_REPOS_DIR"
+OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
+MAX_COMMITS="$DEFAULT_MAX_COMMITS"
+MAX_DIFF_SIZE="$DEFAULT_MAX_DIFF_SIZE"
+MAX_CONTRIBUTING_SIZE="$DEFAULT_MAX_CONTRIBUTING_SIZE"
+THREADS="$DEFAULT_THREADS"
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+	-r | --repos-dir)
+		REPOS_DIR="$2"
+		shift 2
+		;;
+	-o | --output-dir)
+		OUTPUT_DIR="$2"
+		shift 2
+		;;
+	-m | --max-commits)
+		MAX_COMMITS="$2"
+		shift 2
+		;;
+	-d | --max-diff-size)
+		MAX_DIFF_SIZE="$2"
+		shift 2
+		;;
+	-c | --max-contrib-size)
+		MAX_CONTRIBUTING_SIZE="$2"
+		shift 2
+		;;
+	-t | --threads)
+		THREADS="$2"
+		shift 2
+		;;
+	-h | --help)
+		show_help
+		exit 0
+		;;
+	*)
+		echo "Unknown option: $1" >&2
+		show_help >&2
+		exit 1
+		;;
+	esac
+done
+
+# Validate dependencies
+if ! command -v jq &>/dev/null; then
+	echo "Error: 'jq' is required but not installed." >&2
+	exit 1
+fi
+
+if ! command -v parallel &>/dev/null; then
+	echo "Error: 'parallel' (GNU Parallel) is required for parallel processing but not installed." >&2
+	echo "Install it with: apt install parallel (Debian/Ubuntu) or brew install parallel (macOS)" >&2
+	exit 1
+fi
+
+# Ensure output dir exists and get absolute path
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR_ABS=$(cd "$OUTPUT_DIR" && pwd)
+readonly OUTPUT_DIR_ABS
+
+# Sanitize filename (remove control chars and trim whitespace)
+sanitize_name() {
+	local input="$1"
+	printf '%s' "$input" | tr -d '\0\r\n\t' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Function to process a single repo (called in parallel)
+process_repo() {
+	local repo_path="$1"
+	local output_dir_abs="$2"
+	local max_commits="$3"
+	local max_diff_size="$4"
+	local max_contrib_size="$5"
+
+	if [[ ! -d "$repo_path" ]]; then
+		return 0
+	fi
+
+	local raw_name=$(basename "$repo_path")
+	local repo_name
+	repo_name=$(sanitize_name "$raw_name")
+	local output_file="$output_dir_abs/${repo_name}.jsonl"
+
+	{
+		echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Processing repository: $repo_name"
+		cd "$repo_path" || {
+			echo "  ⚠️ Failed to enter $repo_path" >&2
+			return 1
+		}
+
+		# Skip empty repositories
+		local commits
+		if ! commits=$(git log --format=%H -n "$max_commits" 2>/dev/null); then
+			echo "  ⚠️ Skipping empty repository: $repo_name"
+			return 0
+		fi
+
+		: >"$output_file"
+
+		# Detect CONTRIBUTING.md
+		local contributing_path=""
+		if git ls-files --error-unmatch CONTRIBUTING.md >/dev/null 2>&1; then
+			contributing_path="CONTRIBUTING.md"
+		elif git ls-files --error-unmatch .github/CONTRIBUTING.md >/dev/null 2>&1; then
+			contributing_path=".github/CONTRIBUTING.md"
+		elif git ls-files --error-unmatch STYLEGUIDE.md >/dev/null 2>&1; then
+			contributing_path="STYLEGUIDE.md"
+		fi
+
+		# Process each commit
+		while IFS= read -r commit; do
+			{
+				# 0. Commit message
+				local commit_msg
+				commit_msg=$(git log -1 --format=%B "$commit" 2>/dev/null | head -n1 |
+					sed -E \
+						-e 's/\b(fixes|closes|resolves|related|addresses?)\s*#[0-9]+\b//gi' \
+						-e 's/\s*\(#[0-9]+\)//g' \
+						-e 's/\b#[0-9]+\b//g' \
+						-e 's/[[:space:]]+/ /g' \
+						-e 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+						-e 's/[.,;:!?]+$//')
+				if [[ $commit_msg =~ ^[Mm]erge[[:space:]] || $commit_msg =~ ^[Rr]evert[[:space:]] || $commit_msg =~ ^squash! || $commit_msg =~ ^fixup! ]]; then
+					continue
+				fi
+
+				# 1. Diff
+				local change
+				change=$(GIT_PAGER=cat git show --no-color --format= "$commit" 2>/dev/null || echo "")
+				if [[ ${#change} -gt $max_diff_size ]]; then
+					change="${change:0:$max_diff_size}...TRUNCATED"
+				fi
+
+				# 2. Recent commits
+				local recent_commits=""
+				if parent=$(git rev-parse "$commit"^ 2>/dev/null); then
+					recent_commits=$(GIT_PAGER=cat git log --oneline -n 5 "$parent" 2>/dev/null || echo "")
+				fi
+
+				# 3. Code style
+				local code_style=""
+				if [[ -n "$contributing_path" ]]; then
+					code_style=$(git show "$commit:$contributing_path" 2>/dev/null || echo "")
+					if [[ ${#code_style} -gt $max_contrib_size ]]; then
+						code_style="${code_style:0:$max_contrib_size}...TRUNCATED"
+					fi
+				fi
+
+				# 4. Affected files
+				local affected_files
+				affected_files=$(git show --name-only --format= "$commit" 2>/dev/null | grep -v '^$' || echo "")
+
+				# 5. Output JSON
+				jq -c -n \
+					--arg commit_msg "$commit_msg" \
+					--arg change "$change" \
+					--arg recent_commits "$recent_commits" \
+					--arg code_style "$code_style" \
+					--arg affected_files "$affected_files" \
+					'{
+            commit_msg: $commit_msg,
+            change: ($change | gsub("\u0000"; "")),
+            recent_commits_message: $recent_commits,
+            code_style: $code_style,
+            affected_files: ($affected_files | split("\n") | map(select(. != "")))
+          }'
+			} >>"$output_file" 2>/dev/null || echo "  ⚠️ Failed processing commit $commit in $repo_name" >&2
+		done <<<"$commits"
+
+		local commit_count
+		commit_count=$(wc -l <"$output_file" 2>/dev/null || echo 0)
+		echo "  ✅ Extracted $commit_count commits for $repo_name"
+	} >&2 # Redirect logs to stderr so stdout remains clean for parallel
+}
+
+# Export function and variables for parallel
+export -f process_repo
+export -f sanitize_name
+
+# Find all repo directories
+mapfile -d '' repo_dirs < <(find "$REPOS_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+
+if [[ ${#repo_dirs[@]} -eq 0 ]]; then
+	echo "No repositories found in: $REPOS_DIR" >&2
+	exit 0
+fi
+
+# Run in parallel
+printf '%s\n' "${repo_dirs[@]}" |
+	parallel -j "$THREADS" --line-buffer \
+		process_repo {} "$OUTPUT_DIR_ABS" "$MAX_COMMITS" "$MAX_DIFF_SIZE" "$MAX_CONTRIBUTING_SIZE"
+
+echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Extraction complete. Data saved to: $OUTPUT_DIR_ABS"
