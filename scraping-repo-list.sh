@@ -37,17 +37,67 @@ print_progress() {
     printf "\r[%s%s]%s" "$bar" "$empty_bar" "$text"
 }
 
-# Check arguments
-if [ $# -lt 2 ]; then
-    echo "Usage: $0 <max_pages_per_lang> <lang1,lang2,lang3,...>"
-    echo "Example: $0 5 'python,javascript,go'"
+# Show help
+show_help() {
+    cat <<EOF
+Usage: $0 <max_pages_per_lang> <lang1,lang2,...> [OPTIONS]
+
+Fetch top GitHub repositories by language with star filtering.
+
+OPTIONS:
+  --min-stars N    Minimum number of stars (default: 100)
+  -h, --help       Show this help
+
+Example:
+  $0 5 'python,javascript' --min-stars 500
+EOF
+}
+
+# Default values
+MAX_PAGES=""
+LANG_LIST=""
+MIN_STARS=100
+
+# Parse positional args and flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --min-stars)
+            MIN_STARS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            if [[ -z "$MAX_PAGES" ]]; then
+                MAX_PAGES="$1"
+            elif [[ -z "$LANG_LIST" ]]; then
+                LANG_LIST="$1"
+            else
+                echo "Error: Unexpected argument '$1'" >&2
+                show_help >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate required args
+if [[ -z "$MAX_PAGES" ]] || [[ -z "$LANG_LIST" ]]; then
+    echo "Error: Missing required arguments." >&2
+    show_help >&2
     exit 1
 fi
 
-MAX_PAGES="$1"
-LANG_LIST="$2"
+if ! [[ "$MAX_PAGES" =~ ^[0-9]+$ ]] || ! [[ "$MIN_STARS" =~ ^[0-9]+$ ]]; then
+    echo "Error: max_pages and min-stars must be integers." >&2
+    exit 1
+fi
+
 SAFE_LANGS=$(echo "$LANG_LIST" | tr ',' '_' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-OUTPUT_FILE="top_$((MAX_PAGES * 100))_${SAFE_LANGS}_repos.txt"
+OUTPUT_FILE="top_$((MAX_PAGES * 100))_${SAFE_LANGS}_min${MIN_STARS}_repos.txt"
 
 >"$OUTPUT_FILE"
 
@@ -57,72 +107,59 @@ IFS=',' read -ra LANGUAGES <<<"$LANG_LIST"
 # Initialize rate limiting
 declare -a REQUEST_TIMES=()
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    RATE_LIMIT=30   # 30 requests per minute with token
+    RATE_LIMIT=30
     echo "Using GitHub token: rate limit = 30 requests/minute"
 else
-    RATE_LIMIT=10   # 10 requests per minute without token
+    RATE_LIMIT=10
     echo "No GitHub token: rate limit = 10 requests/minute"
 fi
 
-# Wait until we can make another request without exceeding rate limits
+# Wait for rate limit
 wait_for_rate_limit() {
-    local now
-    now=$(date +%s)
-    
-    # Remove timestamps older than 60 seconds
+    local now=$(date +%s)
     while [[ ${#REQUEST_TIMES[@]} -gt 0 ]] && [[ ${REQUEST_TIMES[0]} -le $((now - 60)) ]]; do
         REQUEST_TIMES=("${REQUEST_TIMES[@]:1}")
     done
-    
-    # If we've reached the limit, calculate how long to wait
     if [[ ${#REQUEST_TIMES[@]} -ge $RATE_LIMIT ]]; then
         local earliest=${REQUEST_TIMES[0]}
         local must_wait_until=$((earliest + 60))
         local sleep_sec=$((must_wait_until - now))
-        
         if [[ $sleep_sec -gt 0 ]]; then
             echo "Rate limit reached. Sleeping for $sleep_sec seconds..." >&2
             sleep "$sleep_sec"
             now=$((now + sleep_sec))
         fi
     fi
-    
-    # Record this request time (will be updated after actual request)
     REQUEST_TIMES+=("$now")
 }
 
-# Main scraping loop
+# Main loop
 for lang in "${LANGUAGES[@]}"; do
     lang=$(echo "$lang" | xargs)
-    if [ -z "$lang" ]; then
-        continue
-    fi
+    [[ -z "$lang" ]] && continue
 
-    echo "Fetching top $(($MAX_PAGES * 100)) repos for language: $lang"
+    echo "Fetching top $(($MAX_PAGES * 100)) repos for language: $lang (min stars: $MIN_STARS)"
     for ((i = 1; i <= MAX_PAGES; i++)); do
         print_progress $i $MAX_PAGES
-        
-        # Wait if needed to respect rate limits
+
         wait_for_rate_limit
-        
-        url="https://api.github.com/search/repositories?q=stars:>1+language:${lang}&sort=stars&order=desc&per_page=100&page=$i"
-        
+
+        url="https://api.github.com/search/repositories?q=stars:>$MIN_STARS+language:${lang}&sort=stars&order=desc&per_page=100&page=$i"
+
         if [[ -n "${GITHUB_TOKEN:-}" ]]; then
             response=$(curl -H "Authorization: token $GITHUB_TOKEN" -s "$url")
         else
             response=$(curl -s "$url")
         fi
-        
-        # Extract repository names and append to output file
+
         echo "$response" | jq -r '.items[].full_name' >>"$OUTPUT_FILE" 2>/dev/null
-        
-        # Update the last request timestamp to actual time after request
+
         REQUEST_TIMES[-1]=$(date +%s)
     done
-    echo "" # New line after progress bar
+    echo ""
 done
 
-# Remove duplicates and sort
+# Deduplicate and sort
 sort -u "$OUTPUT_FILE" -o "$OUTPUT_FILE"
 
 echo "Done! Results saved to $OUTPUT_FILE (total $(wc -l <"$OUTPUT_FILE") repos)"
