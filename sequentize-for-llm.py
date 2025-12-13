@@ -11,28 +11,31 @@ except ImportError:
     import json
 
 
-def format_prompt(sample, min_length: int = 3):
+task_instruction = """You are an AI assistant that writes concise, high-quality Git commit messages.
+Task: Refer to the information provided, and then write a concise, imperative commit message describing the change.\n\n"""
+
+def format_prompt(sample, min_length: int = 3, add_instruction_prompt: bool = True):
     parts = []
 
-    # 1. Change
-    change = sample.get("change", "(none)").strip()
-    parts.append(f"Change: {change}")
-
-    # 2. Recent commits message
-    recent = sample.get("recent_commits_message", "(none)").strip()
-    parts.append(f"Recent commits message: {recent}")
-
-    # 3. Code style
-    code_style = sample.get("code_style", "").strip()
-    if code_style:
-        parts.append(f"Code style: {code_style}")
-    else:
-        parts.append("Code style: (not specified)")
-
-    # 4. Affected files
+    # 1. Affected files
     affected = sample.get("affected_files", [])
     affected_str = ", ".join(affected) if affected else "(none)"
     parts.append(f"Affected files: {affected_str}")
+
+    # 2. Change
+    change = sample.get("change", "(none)").strip()
+    parts.append(f"Diff (code changes): {change}")
+
+    # 3. Recent commits message
+    recent = sample.get("recent_commits_message", "(none)").strip()
+    parts.append(f"Recent commit examples: {recent}")
+
+    # 4. Code style
+    code_style = sample.get("code_style", "").strip()
+    if code_style:
+        parts.append(f"Code style guidelines: {code_style}")
+    else:
+        parts.append("Code style guidelines: (not specified)")
 
     # 5. Commit message header
     parts.append("Commit message:")
@@ -43,6 +46,7 @@ def format_prompt(sample, min_length: int = 3):
     if not target or len(target) < min_length:
         return None
 
+    prompt = task_instruction + prompt if add_instruction_prompt else prompt
     return prompt, target
 
 
