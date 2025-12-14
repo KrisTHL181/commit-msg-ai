@@ -46,6 +46,7 @@ Fetch top GitHub repositories by language with star filtering.
 
 OPTIONS:
   --min-stars N    Minimum number of stars (default: 100)
+  --no-archived    Exclude archived repositories (default: false)
   -h, --help       Show this help
 
 Note: Repositories listed in exclude-repos.sh (as EXCLUDE_REPOS array) will be excluded.
@@ -56,6 +57,7 @@ EOF
 MAX_PAGES=""
 LANG_LIST=""
 MIN_STARS=100
+NO_ARCHIVED=false
 
 # Parse positional args and flags
 while [[ $# -gt 0 ]]; do
@@ -67,6 +69,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             show_help
             exit 0
+            ;;
+        --no-archived)
+            NO_ARCHIVED=true
+            shift
             ;;
         *)
             if [[ -z "$MAX_PAGES" ]]; then
@@ -142,6 +148,12 @@ wait_for_rate_limit() {
     REQUEST_TIMES+=("$now")
 }
 
+if $NO_ARCHIVED; then
+    base_url="https://api.github.com/search/repositories?q=stars:>$MIN_STARS+language:${lang}+archived:${NO_ARCHIVED}&sort=stars&order=desc&per_page=100&"
+else
+    base_url="https://api.github.com/search/repositories?q=stars:>$MIN_STARS+language:${lang}&sort=stars&order=desc&per_page=100&"
+fi
+
 # Main loop
 for lang in "${LANGUAGES[@]}"; do
     lang=$(echo "$lang" | xargs)
@@ -153,7 +165,7 @@ for lang in "${LANGUAGES[@]}"; do
 
         wait_for_rate_limit
 
-        url="https://api.github.com/search/repositories?q=stars:>$MIN_STARS+language:${lang}&sort=stars&order=desc&per_page=100&page=$i"
+        url="${base_url}page=$i"
 
         if [[ -n "${GITHUB_TOKEN:-}" ]]; then
             response=$(curl -H "Authorization: token $GITHUB_TOKEN" -s "$url")
