@@ -1,62 +1,87 @@
 #!/bin/bash
 
-# Root directory to scan (defaults to current directory if not provided as argument)
-ROOT_DIR="${1:-.}"
+# This script scans a user-specified directory and removes any subdirectory
+# that is not a fully functional (non-corrupted) Git repository.
 
-# Convert to absolute path to avoid issues with relative paths
-ROOT_DIR="$(cd "$ROOT_DIR" && pwd)"
-
-# Check if the specified root directory exists
-if [ ! -d "$ROOT_DIR" ]; then
-  echo "Error: Directory '$ROOT_DIR' does not exist." >&2
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 <directory>"
+  echo "  Scans <directory> for incomplete/corrupted Git repositories and deletes them."
+  echo "  You MUST specify the directory explicitly to avoid accidental data loss."
   exit 1
 fi
 
-echo "Scanning for incomplete or corrupted Git repositories under: $ROOT_DIR"
+TARGET_DIR="$1"
 
-# Iterate over all immediate subdirectories of ROOT_DIR
-for dir in "$ROOT_DIR"/*/; do
-  # Skip if not a directory (e.g., symbolic links that break, or glob mismatches)
-  [ -d "$dir" ] || continue
+# Resolve to absolute path
+if ! TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"; then
+  echo "Error: Unable to access directory '$1'." >&2
+  exit 1
+fi
 
-  dir_name=$(basename "$dir")
-  full_path="$ROOT_DIR/$dir_name"
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "Error: '$TARGET_DIR' is not a directory." >&2
+  exit 1
+fi
 
-  # Check if it's a Git repository (must contain .git directory)
+# Safety: ensure the path is not root or home
+case "$TARGET_DIR" in
+  "/"|"/home"|"/Users"|"/usr"|"/var"|"/tmp"|"/bin"|"/lib"|"/sbin")
+    echo "Error: Refusing to operate on system directory: $TARGET_DIR" >&2
+    exit 1
+    ;;
+esac
+
+# Confirm with user
+echo "⚠️  This script will DELETE incomplete or corrupted Git repos under:"
+echo "    $TARGET_DIR"
+read -p "Are you sure? Type 'yes' to continue: " -r
+if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+  echo "Aborted."
+  exit 0
+fi
+
+echo "🔍 Scanning subdirectories in: $TARGET_DIR"
+
+# Process each immediate subdirectory
+for subdir in "$TARGET_DIR"/*/; do
+  [ -d "$subdir" ] || continue
+  repo_path="$subdir"
+
+  # Remove trailing slash for consistent basename
+  repo_name=$(basename "$repo_path")
+  full_path="$TARGET_DIR/$repo_name"
+
+  # Skip if not a Git repo
   if [ ! -d "$full_path/.git" ]; then
-    echo "🗑️  Not a Git repository (missing .git): $full_path → DELETING"
+    echo "🗑️  Not a Git repository (no .git): $full_path → DELETING"
     rm -rf "$full_path"
     continue
   fi
 
-  # Run integrity checks inside a subshell to avoid affecting current working directory
+  # Perform integrity checks in a subshell
   (
     cd "$full_path" || exit 1
 
-    # Verify that HEAD points to a valid commit
+    # Check valid HEAD
     if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
-      echo "🗑️  Invalid or missing HEAD: $full_path → DELETING"
       exit 1
     fi
 
-    # Check repository object integrity; suppress 'dangling' output (non-fatal)
+    # Check object integrity (ignore dangling objects)
     if ! git fsck --full --no-dangling >/dev/null 2>&1; then
-      echo "🗑️  Git integrity check failed (corrupted/incomplete objects): $full_path → DELETING"
       exit 1
     fi
 
-    # Ensure we can read at least one commit from history
+    # Ensure commit history is readable
     if ! git log -1 --oneline >/dev/null 2>&1; then
-      echo "🗑️  Unable to read commit history: $full_path → DELETING"
       exit 1
     fi
 
-    # All checks passed
     exit 0
   )
 
-  # If any check failed (subshell exited non-zero), remove the directory
   if [ $? -ne 0 ]; then
+    echo "🗑️  Incomplete or corrupted repo: $full_path → DELETING"
     rm -rf "$full_path"
   else
     echo "✅ OK: $full_path"
