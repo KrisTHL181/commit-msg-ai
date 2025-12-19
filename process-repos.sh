@@ -11,6 +11,7 @@ DEFAULT_MAX_COMMITS=1000
 DEFAULT_MAX_DIFF_SIZE=50000         # 50 KB
 DEFAULT_MAX_CONTRIBUTING_SIZE=10000 # 10 KB
 DEFAULT_THREADS=4
+DEFAULT_SKIP_BOT_COMMITS=false
 
 show_help() {
 	cat <<EOF
@@ -25,12 +26,13 @@ OPTIONS:
   -d, --max-diff-size BYTES    Truncate diffs larger than this (default: $DEFAULT_MAX_DIFF_SIZE bytes)
   -c, --max-contrib-size BYTES Truncate CONTRIBUTING.md larger than this (default: $DEFAULT_MAX_CONTRIBUTING_SIZE bytes)
   -t, --threads N              Number of parallel threads (default: $DEFAULT_THREADS)
+  -b, --skip-bot-commits       Skip commits whose author name contains 'bot' (case-insensitive)
   -h, --help                   Show this help message
 
 REQUIRES: jq, GNU parallel
 
 EXAMPLE:
-  $0 -r ./my_repos -o ./dataset -m 500 -t 8
+  $0 -r ./my_repos -o ./dataset -m 500 -t 8 --skip-bot-commits
 EOF
 }
 
@@ -41,6 +43,7 @@ MAX_COMMITS="$DEFAULT_MAX_COMMITS"
 MAX_DIFF_SIZE="$DEFAULT_MAX_DIFF_SIZE"
 MAX_CONTRIBUTING_SIZE="$DEFAULT_MAX_CONTRIBUTING_SIZE"
 THREADS="$DEFAULT_THREADS"
+SKIP_BOT_COMMITS="$DEFAULT_SKIP_BOT_COMMITS"
 
 while [[ $# -gt 0 ]]; do
 	case $1 in
@@ -67,6 +70,10 @@ while [[ $# -gt 0 ]]; do
 	-t | --threads)
 		THREADS="$2"
 		shift 2
+		;;
+	-b | --skip-bot-commits)
+		SKIP_BOT_COMMITS=true
+		shift
 		;;
 	-h | --help)
 		show_help
@@ -110,6 +117,7 @@ process_repo() {
 	local max_commits="$3"
 	local max_diff_size="$4"
 	local max_contrib_size="$5"
+	local skip_bot_commits="$6"
 
 	if [[ ! -d "$repo_path" ]]; then
 		return 0
@@ -149,6 +157,14 @@ process_repo() {
 		# Process each commit
 		while IFS= read -r commit; do
 			{
+				# Check if commit author is a bot
+				if [[ "$skip_bot_commits" == true ]]; then
+					author_name=$(git log -1 --format=%an "$commit" 2>/dev/null)
+					if echo "$author_name" | grep -qiE '\b(bot|robot)\b|\[bot\]'; then
+						continue
+					fi
+				fi
+
 				# 0. Commit message
 				local commit_msg
 				commit_msg=$(git log -1 --format=%B "$commit" 2>/dev/null | head -n1 |
@@ -209,7 +225,7 @@ process_repo() {
 		local commit_count
 		commit_count=$(wc -l <"$output_file" 2>/dev/null || echo 0)
 		echo "  ✅ Extracted $commit_count commits for $repo_name"
-	} >&2 # Redirect logs to stderr so stdout remains clean for parallel
+	} >&2
 }
 
 # Export function and variables for parallel
@@ -227,6 +243,6 @@ fi
 # Run in parallel
 printf '%s\n' "${repo_dirs[@]}" |
 	parallel -j "$THREADS" --line-buffer \
-		process_repo {} "$OUTPUT_DIR_ABS" "$MAX_COMMITS" "$MAX_DIFF_SIZE" "$MAX_CONTRIBUTING_SIZE"
+		process_repo {} "$OUTPUT_DIR_ABS" "$MAX_COMMITS" "$MAX_DIFF_SIZE" "$MAX_CONTRIBUTING_SIZE" "$SKIP_BOT_COMMITS"
 
 echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Extraction complete. Data saved to: $OUTPUT_DIR_ABS"
