@@ -12,6 +12,7 @@ DEFAULT_MAX_DIFF_SIZE=50000         # 50 KB
 DEFAULT_MAX_CONTRIBUTING_SIZE=10000 # 10 KB
 DEFAULT_THREADS=4
 DEFAULT_SKIP_BOT_COMMITS=false
+DEFAULT_MARK_SOURCE=false
 
 show_help() {
 	cat <<EOF
@@ -27,12 +28,13 @@ OPTIONS:
   -c, --max-contrib-size BYTES Truncate CONTRIBUTING.md larger than this (default: $DEFAULT_MAX_CONTRIBUTING_SIZE bytes)
   -t, --threads N              Number of parallel threads (default: $DEFAULT_THREADS)
   -b, --skip-bot-commits       Skip commits whose author name contains 'bot' (case-insensitive)
+  -s, --mark-source            Mark commits with source repository URL
   -h, --help                   Show this help message
 
 REQUIRES: jq, GNU parallel
 
 EXAMPLE:
-  $0 -r ./my_repos -o ./dataset -m 500 -t 8 --skip-bot-commits
+  $0 -r ./my_repos -o ./dataset -m 500 -t 8 --skip-bot-commits --mark-source
 EOF
 }
 
@@ -79,6 +81,10 @@ while [[ $# -gt 0 ]]; do
 		show_help
 		exit 0
 		;;
+	-s | --mark-source)
+		MARK_SOURCE=true
+		shift
+		;;
 	*)
 		echo "Unknown option: $1" >&2
 		show_help >&2
@@ -118,6 +124,7 @@ process_repo() {
 	local max_diff_size="$4"
 	local max_contrib_size="$5"
 	local skip_bot_commits="$6"
+	local mark_source="$7"
 
 	if [[ ! -d "$repo_path" ]]; then
 		return 0
@@ -143,6 +150,24 @@ process_repo() {
 		fi
 
 		: >"$output_file"
+
+		# Get repository source URL
+		local repo_source_json="{}"
+		if [[ "$mark_source" == true ]]; then
+			# Get repository source URL from remote -v output
+			local fetch_url push_url
+			fetch_url=$(git remote get-url origin 2>/dev/null || git remote -v 2>/dev/null | awk '/fetch/{print $2; exit}' || echo "")
+			push_url=$(git remote get-url --push origin 2>/dev/null || git remote -v 2>/dev/null | awk '/push/{print $2; exit}' || echo "")
+			if [[ -n "$fetch_url" || -n "$push_url" ]]; then
+				repo_source_json=$(jq -n \
+					--arg fetch "$fetch_url" \
+					--arg push "$push_url" \
+					'{
+						fetch: ($fetch | select(length > 0)),
+						push: ($push | select(length > 0))
+					}' | jq 'with_entries(select(.value != null))')
+			fi
+		fi
 
 		# Detect CONTRIBUTING.md
 		local contributing_path=""
@@ -212,12 +237,14 @@ process_repo() {
 					--arg recent_commits "$recent_commits" \
 					--arg code_style "$code_style" \
 					--arg affected_files "$affected_files" \
+					--argjson repo_source "$repo_source_json" \
 					'{
             commit_msg: $commit_msg,
             change: ($change | gsub("\u0000"; "")),
             recent_commits_message: $recent_commits,
             code_style: $code_style,
-            affected_files: ($affected_files | split("\n") | map(select(. != "")))
+            affected_files: ($affected_files | split("\n") | map(select(. != ""))),
+            repo_source: $repo_source
           }'
 			} >>"$output_file" 2>/dev/null || echo "  ⚠️ Failed processing commit $commit in $repo_name" >&2
 		done <<<"$commits"
