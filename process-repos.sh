@@ -13,6 +13,7 @@ DEFAULT_MAX_CONTRIBUTING_SIZE=10000 # 10 KB
 DEFAULT_THREADS=4
 DEFAULT_SKIP_BOT_COMMITS=false
 DEFAULT_MARK_SOURCE=false
+DEFAULT_INCLUDE_LICENSE=false
 
 show_help() {
 	cat <<EOF
@@ -29,12 +30,14 @@ OPTIONS:
   -t, --threads N              Number of parallel threads (default: $DEFAULT_THREADS)
   -b, --skip-bot-commits       Skip commits whose author name contains 'bot' (case-insensitive)
   -s, --mark-source            Mark commits with source repository URL
+      --include-license        Include license information using 'licensee detect' (requires licensee command)
   -h, --help                   Show this help message
 
 REQUIRES: jq, GNU parallel
+OPTIONAL (when using --include-license): licensee
 
 EXAMPLE:
-  $0 -r ./my_repos -o ./dataset -m 500 -t 8 --skip-bot-commits --mark-source
+  $0 -r ./my_repos -o ./dataset -m 500 -t 8 --skip-bot-commits --mark-source --include-license
 EOF
 }
 
@@ -46,6 +49,8 @@ MAX_DIFF_SIZE="$DEFAULT_MAX_DIFF_SIZE"
 MAX_CONTRIBUTING_SIZE="$DEFAULT_MAX_CONTRIBUTING_SIZE"
 THREADS="$DEFAULT_THREADS"
 SKIP_BOT_COMMITS="$DEFAULT_SKIP_BOT_COMMITS"
+MARK_SOURCE="$DEFAULT_MARK_SOURCE"
+INCLUDE_LICENSE="$DEFAULT_INCLUDE_LICENSE"
 
 while [[ $# -gt 0 ]]; do
 	case $1 in
@@ -77,13 +82,17 @@ while [[ $# -gt 0 ]]; do
 		SKIP_BOT_COMMITS=true
 		shift
 		;;
-	-h | --help)
-		show_help
-		exit 0
-		;;
 	-s | --mark-source)
 		MARK_SOURCE=true
 		shift
+		;;
+	--include-license)
+		INCLUDE_LICENSE=true
+		shift
+		;;
+	-h | --help)
+		show_help
+		exit 0
 		;;
 	*)
 		echo "Unknown option: $1" >&2
@@ -102,6 +111,13 @@ fi
 if ! command -v parallel &>/dev/null; then
 	echo "Error: 'parallel' (GNU Parallel) is required for parallel processing but not installed." >&2
 	echo "Install it with: apt install parallel (Debian/Ubuntu) or brew install parallel (macOS)" >&2
+	exit 1
+fi
+
+# Validate licensee if needed
+if [[ "$INCLUDE_LICENSE" == true ]] && ! command -v licensee &>/dev/null; then
+	echo "Error: 'licensee' is required for --include-license but not installed." >&2
+	echo "Install it with: gem install licensee" >&2
 	exit 1
 fi
 
@@ -125,6 +141,7 @@ process_repo() {
 	local max_contrib_size="$5"
 	local skip_bot_commits="$6"
 	local mark_source="$7"
+	local include_license="$8"
 
 	if [[ ! -d "$repo_path" ]]; then
 		return 0
@@ -179,11 +196,65 @@ process_repo() {
 			contributing_path="STYLEGUIDE.md"
 		fi
 
+		# Get license info if requested
+		local license_info=""
+		if [[ "$include_license" == true ]]; then
+			# List files in root directory (tracked by git)
+			local files_in_root
+			files_in_root=$(git ls-files 2>/dev/null | grep -v /) || files_in_root=""
+
+			# Try standard license filenames first
+			local license_file=""
+			for candidate in LICENSE LICENSE.txt LICENSE.md COPYING COPYING.txt COPYING.md; do
+				if echo "$files_in_root" | grep -q "^$candidate$"; then
+					license_file="$candidate"
+					break
+				fi
+			done
+
+			# If no standard file, search for files containing "license" or "copying" (case-insensitive)
+			if [[ -z "$license_file" ]]; then
+				license_file=$(echo "$files_in_root" | grep -iE '(license|copying)' | head -n1 | tr -d '\r\n')
+			fi
+
+			# Process license file if found
+			if [[ -n "$license_file" ]]; then
+				local license_output
+				license_output=$(licensee detect --json "$license_file" 2>/dev/null || echo "{}")
+				
+				# Extract license using .licenses[0].key or .spdx_id, fallback to .license (old format)
+				if jq -e '.licenses | length > 0' <<< "$license_output" &>/dev/null; then
+					license_info=$(jq -r '
+						.licenses[0].key // 
+						.licenses[0].spdx_id // 
+						"Unknown License"
+					' <<< "$license_output")
+				elif jq -e '.license' <<< "$license_output" &>/dev/null; then
+					license_info=$(jq -r '
+						.license.key // 
+						.license.spdx_id // 
+						.license.name // 
+						"Unknown License"
+					' <<< "$license_output")
+				else
+					license_info="Unknown License (file: $license_file)"
+				fi
+
+				# Normalize null/empty to "Unknown License"
+				if [[ -z "$license_info" || "$license_info" == "null" ]]; then
+					license_info="Unknown License"
+				fi
+			else
+				license_info="No License"
+			fi
+		fi
+
 		# Process each commit
 		while IFS= read -r commit; do
 			{
 				# Check if commit author is a bot
 				if [[ "$skip_bot_commits" == true ]]; then
+					local author_name
 					author_name=$(git log -1 --format=%an "$commit" 2>/dev/null)
 					if echo "$author_name" | grep -qiE '\b(bot|robot)\b|\[bot\]'; then
 						continue
@@ -213,6 +284,7 @@ process_repo() {
 
 				# 2. Recent commits
 				local recent_commits=""
+				local parent
 				if parent=$(git rev-parse "$commit"^ 2>/dev/null); then
 					recent_commits=$(GIT_PAGER=cat git log --oneline -n 5 "$parent" 2>/dev/null || echo "")
 				fi
@@ -230,22 +302,42 @@ process_repo() {
 				local affected_files
 				affected_files=$(git show --name-only --format= "$commit" 2>/dev/null | grep -v '^$' || echo "")
 
-				# 5. Output JSON
-				jq -c -n \
-					--arg commit_msg "$commit_msg" \
-					--arg change "$change" \
-					--arg recent_commits "$recent_commits" \
-					--arg code_style "$code_style" \
-					--arg affected_files "$affected_files" \
-					--argjson repo_source "$repo_source_json" \
-					'{
-            commit_msg: $commit_msg,
-            change: ($change | gsub("\u0000"; "")),
-            recent_commits_message: $recent_commits,
-            code_style: $code_style,
-            affected_files: ($affected_files | split("\n") | map(select(. != ""))),
-            repo_source: $repo_source
-          }'
+				# 5. Output JSON with conditional license field
+				if [[ "$include_license" == true ]]; then
+					jq -c -n \
+						--arg commit_msg "$commit_msg" \
+						--arg change "$change" \
+						--arg recent_commits "$recent_commits" \
+						--arg code_style "$code_style" \
+						--arg affected_files "$affected_files" \
+						--argjson repo_source "$repo_source_json" \
+						--arg license_info "$license_info" \
+						'{
+							commit_msg: $commit_msg,
+							change: ($change | gsub("\u0000"; "")),
+							recent_commits_message: $recent_commits,
+							code_style: $code_style,
+							affected_files: ($affected_files | split("\n") | map(select(. != ""))),
+							repo_source: $repo_source,
+							license: $license_info
+						}'
+				else
+					jq -c -n \
+						--arg commit_msg "$commit_msg" \
+						--arg change "$change" \
+						--arg recent_commits "$recent_commits" \
+						--arg code_style "$code_style" \
+						--arg affected_files "$affected_files" \
+						--argjson repo_source "$repo_source_json" \
+						'{
+							commit_msg: $commit_msg,
+							change: ($change | gsub("\u0000"; "")),
+							recent_commits_message: $recent_commits,
+							code_style: $code_style,
+							affected_files: ($affected_files | split("\n") | map(select(. != ""))),
+							repo_source: $repo_source
+						}'
+				fi
 			} >>"$output_file" 2>/dev/null || echo "  ⚠️ Failed processing commit $commit in $repo_name" >&2
 		done <<<"$commits"
 
@@ -268,8 +360,8 @@ if [[ ${#repo_dirs[@]} -eq 0 ]]; then
 fi
 
 # Run in parallel
-printf '%s\n' "${repo_dirs[@]}" |
-	parallel -j "$THREADS" --line-buffer \
-		process_repo {} "$OUTPUT_DIR_ABS" "$MAX_COMMITS" "$MAX_DIFF_SIZE" "$MAX_CONTRIBUTING_SIZE" "$SKIP_BOT_COMMITS"
+printf '%s\0' "${repo_dirs[@]}" |
+	parallel -0 -j "$THREADS" --line-buffer \
+		process_repo {} "$OUTPUT_DIR_ABS" "$MAX_COMMITS" "$MAX_DIFF_SIZE" "$MAX_CONTRIBUTING_SIZE" "$SKIP_BOT_COMMITS" "$MARK_SOURCE" "$INCLUDE_LICENSE"
 
 echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Extraction complete. Data saved to: $OUTPUT_DIR_ABS"
