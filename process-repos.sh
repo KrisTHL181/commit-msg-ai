@@ -302,7 +302,7 @@ process_repo() {
 				local affected_files
 				affected_files=$(git show --name-only --format= "$commit" 2>/dev/null | grep -v '^$' || echo "")
 
-				# 5. Output JSON with conditional license field
+				# 5. Output JSON with conditional license and repo_source fields
 				if [[ "$include_license" == true ]]; then
 					jq -c -n \
 						--arg commit_msg "$commit_msg" \
@@ -312,15 +312,16 @@ process_repo() {
 						--arg affected_files "$affected_files" \
 						--argjson repo_source "$repo_source_json" \
 						--arg license_info "$license_info" \
+						--arg mark_source_flag "$mark_source" \
 						'{
 							commit_msg: $commit_msg,
 							change: ($change | gsub("\u0000"; "")),
 							recent_commits_message: $recent_commits,
 							code_style: $code_style,
-							affected_files: ($affected_files | split("\n") | map(select(. != ""))),
-							repo_source: $repo_source,
-							license: $license_info
-						}'
+							affected_files: ($affected_files | split("\n") | map(select(. != "")))
+						}
+						+ (if $mark_source_flag == "true" then {repo_source: $repo_source} else {} end)
+						+ {license: $license_info}'
 				else
 					jq -c -n \
 						--arg commit_msg "$commit_msg" \
@@ -329,14 +330,15 @@ process_repo() {
 						--arg code_style "$code_style" \
 						--arg affected_files "$affected_files" \
 						--argjson repo_source "$repo_source_json" \
+						--arg mark_source_flag "$mark_source" \
 						'{
 							commit_msg: $commit_msg,
 							change: ($change | gsub("\u0000"; "")),
 							recent_commits_message: $recent_commits,
 							code_style: $code_style,
-							affected_files: ($affected_files | split("\n") | map(select(. != ""))),
-							repo_source: $repo_source
-						}'
+							affected_files: ($affected_files | split("\n") | map(select(. != "")))
+						}
+						+ (if $mark_source_flag == "true" then {repo_source: $repo_source} else {} end)'
 				fi
 			} >>"$output_file" 2>/dev/null || echo "  ⚠️ Failed processing commit $commit in $repo_name" >&2
 		done <<<"$commits"
