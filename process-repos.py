@@ -5,6 +5,7 @@ import subprocess
 import concurrent.futures
 import re
 import sys
+from tqdm import tqdm
 
 try:
     import orjson
@@ -286,11 +287,16 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
         futures = {executor.submit(process_repo, r, args): r for r in repos}
-        for future in concurrent.futures.as_completed(futures):
+        for future in tqdm(
+            concurrent.futures.as_completed(futures),
+            total=len(futures),
+            desc="Processing repos",
+            file=sys.stderr
+        ):
             try:
                 result = future.result()
                 if result:
-                    print(result)
+                    tqdm.write(result)
             except Exception as e:
                 print(f"❌ Critical Thread Failure: {e}")
 
