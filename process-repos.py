@@ -6,6 +6,7 @@ import concurrent.futures
 import re
 import sys
 from tqdm import tqdm
+import pygit2
 
 try:
     import orjson
@@ -29,6 +30,10 @@ REGEX_FILTER_MERGE = re.compile(r"^[Mm]erge\s")
 REGEX_FILTER_REVERT = re.compile(r"^[Rr]evert\s")
 BOT_PATTERN = re.compile(r"\b(?:bot|robot)\b|\[bot\]", re.IGNORECASE)
 
+
+def get_empty_tree(repo):
+    builder = repo.TreeBuilder()
+    return repo[builder.write()]
 
 def clamp(x, min_val, max_val):
     return max(min_val, min(x, max_val))
@@ -61,14 +66,13 @@ def get_repo_metadata(repo_path, include_license=False):
     """Extracts metadata; ignores external tool failures but reports them."""
     meta = {"license": "Unknown"}
     try:
-        remote_out = subprocess.check_output(
-            ["git", "remote", "-v"], cwd=repo_path, stderr=subprocess.DEVNULL, text=True
-        )
-        fetch = next((line.split()[1] for line in remote_out.splitlines() if "(fetch)" in line), None)
-        if fetch:
-            meta["repo_source"] = fetch
-    except (subprocess.CalledProcessError, IndexError, FileNotFoundError) as e:
-        print(f"  ⚠️  Could not get remotes for {repo_path}: {e}")
+        repo = pygit2.Repository(repo_path)
+        for remote in repo.remotes:
+            if remote.url:
+                meta["repo_source"] = remote.url
+                break
+    except (pygit2.GitError, KeyError) as e:
+        print(f"  ⚠️  Could not get remotes for {repo_path}: {type(e).__name__}")
 
     if include_license:
         try:
@@ -100,93 +104,102 @@ def get_repo_metadata(repo_path, include_license=False):
 
     return meta, contrib_content
 
+def get_commit_diff_and_files(repo, commit, max_diff_size):
+    diff_text = []
+    affected_files = set()
+
+    if commit.parents:
+        diff = repo.diff(commit.parents[0].tree, commit.tree)
+    else:
+        empty_tree = get_empty_tree(repo)
+        diff = repo.diff(empty_tree, commit.tree)
+
+    for patch in diff:
+        if patch.delta.new_file:
+            affected_files.add(patch.delta.new_file.path)
+        if patch.delta.old_file:
+            affected_files.add(patch.delta.old_file.path)
+
+        diff_text.append(patch.text)
+
+        if sum(len(d) for d in diff_text) > max_diff_size:
+            break
+
+    joined = "".join(diff_text)
+    if len(joined) > max_diff_size:
+        joined = joined[:max_diff_size] + "...TRUNCATED"
+
+    return joined, sorted(affected_files)
 
 def process_repo(repo_path, args):
-    """Processes a repo. Uses history slicing for context to avoid subshell overhead."""
-    # Logic to handle path resolution
     repo_path = os.path.abspath(repo_path)
-    if not os.path.isdir(os.path.join(repo_path, ".git")):
-        return f"Skipped: {repo_path} (No .git folder)"
+    try:
+        repo = pygit2.Repository(repo_path)
+    except (pygit2.GitError, KeyError, OSError):
+        return f"Skipped: {repo_path} (Not a valid git repo)"
 
     repo_name = os.path.basename(repo_path)
     output_file = os.path.join(args.output_dir, f"{repo_name}.jsonl")
 
-    meta, contrib_content = get_repo_metadata(repo_path, include_license=args.include_license)
+    meta, contrib_content = get_repo_metadata(repo_path, args.include_license)
     if len(contrib_content) > args.max_contrib_size:
         contrib_content = contrib_content[: args.max_contrib_size] + "...TRUNCATED"
 
-    # Fetch Hash, Author, and raw Subject
-    cmd = ["git", "log", f"-n{args.max_commits + 5}", "--format=%H%x00%an%x00%s%x00PRE_END_COMMIT", "--no-merges"]
-    try:
-        log_output = subprocess.check_output(cmd, cwd=repo_path, stderr=subprocess.DEVNULL, text=True, errors="replace")
-    except subprocess.CalledProcessError as e:
-        return f"Error running git log in {repo_name}: {e}"
+    walker = repo.walk(repo.head.target, pygit2.GIT_SORT_TIME)
+    walker.hide(repo.head.target)
 
-    raw_entries = [e for e in log_output.split("PRE_END_COMMIT\n") if e.strip()]
-
+    commits = []
     history_lines = []
-    processed_commits = []
-    for entry in raw_entries:
-        parts = entry.split("\0")
-        if len(parts) < 3:
-            continue
-        h, auth, msg = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        history_lines.append(f"{h[:7]} {msg}")
-        processed_commits.append({"hash": h, "author": auth, "raw_msg": msg})
+
+    for commit in repo.walk(repo.head.target, pygit2.GIT_SORT_TIME):
+        if len(commit.parents) > 1:
+            continue  # no merges
+
+        msg = commit.message.split("\n", 1)[0]
+        history_lines.append(f"{str(commit.id)[:7]} {msg}")
+
+        commits.append(commit)
+        if len(commits) >= args.max_commits + 5:
+            break
 
     count = 0
     try:
         with open(output_file, "wb") as f:
-            for i in range(min(len(processed_commits), args.max_commits)):
-                c_info = processed_commits[i]
-                commit_msg = c_info["raw_msg"]
+            for i, commit in enumerate(commits[: args.max_commits]):
+                msg = commit.message.strip()
 
-                # Skip Merge/Revert
                 if (
-                    REGEX_FILTER_MERGE.match(commit_msg)
-                    or REGEX_FILTER_REVERT.match(commit_msg)
-                    or commit_msg.startswith(("squash!", "fixup!"))
+                    REGEX_FILTER_MERGE.match(msg)
+                    or REGEX_FILTER_REVERT.match(msg)
+                    or msg.startswith(("squash!", "fixup!"))
                 ):
                     continue
 
-                if args.skip_bot_commits and BOT_PATTERN.search(c_info["author"]):
+                author_name = commit.author.name or ""
+                if args.skip_bot_commits and BOT_PATTERN.search(author_name):
                     continue
 
                 recent_context = "\n".join(history_lines[i + 1 : i + 6])
-                try:
-                    diff_text = subprocess.check_output(
-                        ["git", "show", "--format=", "--no-color", c_info["hash"]],
-                        cwd=repo_path,
-                        stderr=subprocess.DEVNULL,
-                        text=True,
-                        errors="replace",
-                    )
-                    if len(diff_text) > args.max_diff_size:
-                        diff_text = diff_text[: args.max_diff_size] + "...TRUNCATED"
 
-                    files_out = subprocess.check_output(
-                        ["git", "show", "--name-only", "--format=", c_info["hash"]],
-                        cwd=repo_path,
-                        text=True,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    affected_files = [line for line in files_out.splitlines() if line.strip()]
+                diff_text, affected_files = get_commit_diff_and_files(
+                    repo, commit, args.max_diff_size
+                )
 
-                    entry = {
-                        "commit_msg": clean_message(commit_msg),
-                        "change": diff_text,
-                        "recent_commits_message": recent_context,
-                        "license": meta["license"],
-                        "code_style": contrib_content,
-                        "affected_files": affected_files,
-                    }
-                    if args.mark_source and "repo_source" in meta:
-                        entry["repo_source"] = meta["repo_source"]
+                entry = {
+                    "commit_msg": clean_message(msg),
+                    "change": diff_text,
+                    "recent_commits_message": recent_context,
+                    "license": meta["license"],
+                    "code_style": contrib_content,
+                    "affected_files": affected_files,
+                }
 
-                    f.write(serialize_json(entry))
-                    count += 1
-                except subprocess.CalledProcessError:
-                    continue
+                if args.mark_source and "repo_source" in meta:
+                    entry["repo_source"] = meta["repo_source"]
+
+                f.write(serialize_json(entry))
+                count += 1
+
     except OSError as e:
         return f"File Error for {repo_name}: {e}"
 
@@ -285,7 +298,7 @@ def main():
         print("❌ No valid Git repositories found. Stopping.")
         sys.exit(1)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.threads) as executor:
         futures = {executor.submit(process_repo, r, args): r for r in repos}
         for future in tqdm(
             concurrent.futures.as_completed(futures),
